@@ -62,6 +62,7 @@ func main() {
 	for field, value := range results {
 		jobChan <- MMUpdateTime{field, value}
 	}
+	close(jobChan)
 	wg.Wait()
 	_, err := pipe.Exec(ctx)
 	if err != nil {
