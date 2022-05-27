@@ -6,6 +6,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"go-redis-demo/pkg/postgres"
 	redispkg "go-redis-demo/pkg/redis"
+	"gorm.io/gorm"
 	"log"
 	"strings"
 	"sync"
@@ -16,40 +17,52 @@ type Betfair struct {
 	EventId string `json:"event_id"`
 }
 
-var ctx = context.Background()
-var rdb = redispkg.NewRedisClient()
+type MMUpdateTime struct {
+	Field      string
+	UpdateTime string
+}
 
-const MmUpdateTimeKey = "mm_update_time"
-const TimeFormat = time.RFC3339Nano
+type MMUpdateTimeRepository struct {
+	db  *gorm.DB
+	rdb *redis.Client
+}
 
-var events = getAllDoneEvents() // 取得 betfair 所有已完成的 event_id
+const (
+	MmUpdateTimeKey = "mm_update_time"
+	TimeFormat      = time.RFC3339Nano
+	ExpireTime      = "72h"
+)
+
+var (
+	ctx     = context.Background()
+	wg      = new(sync.WaitGroup)
+	jobChan = make(chan MMUpdateTime, 1000)
+)
 
 func main() {
-	wg := new(sync.WaitGroup)
-	keyChan := make(chan string, 100)
+
+	db := postgres.NewPostgresClient()
+	rdb := redispkg.NewRedisClient()
+	repo := NewMMUpdateTimeRepo(db, rdb)
 
 	// 產生 redis 假資料
-	setFakeMMUpdateTime()
-
+	repo.setFakeMMUpdateTime()
+	// 取得 betfair 所有已完成的 event_id
+	events := repo.getAllDoneEvents()
 	// 取得 hash{ mm_update_time } 所有的 Key 並且丟進 channel 中
-	keys := getMMUpdateTimeKeys()
-	wg.Add(len(keys))
-
+	results := repo.getAllMMUpdateTime()
+	wg.Add(len(results))
 	// 開啟 transaction pipeline
-	pipe := rdb.TxPipeline()
-
+	pipe := repo.rdb.TxPipeline()
 	// 開啟 10 個 worker -> 取得一個 key 開始跟 event_id 比對, 如果在其中就 HDel Key
 	for i := 0; i < 10; i++ {
-		go worker(keyChan, wg, pipe)
+		go repo.worker(jobChan, wg, pipe, events)
 	}
-
-	// 插入 keyChan
-	for _, key := range keys {
-		keyChan <- key
+	// 插入 jobChan
+	for field, value := range results {
+		jobChan <- MMUpdateTime{field, value}
 	}
-
 	wg.Wait()
-	// transaction pipeline commit
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		log.Println("pipeline error")
@@ -58,32 +71,46 @@ func main() {
 	log.Println("done")
 }
 
-func worker(keyChan <-chan string, wg *sync.WaitGroup, pipe redis.Pipeliner) {
-	for key := range keyChan {
-		eventId := strings.Split(key, "_")[0]
+func NewMMUpdateTimeRepo(db *gorm.DB, rdb *redis.Client) *MMUpdateTimeRepository {
+	return &MMUpdateTimeRepository{
+		db:  db,
+		rdb: rdb,
+	}
+}
+
+func (repo *MMUpdateTimeRepository) worker(jobChan <-chan MMUpdateTime, wg *sync.WaitGroup, pipe redis.Pipeliner, events []Betfair) {
+	for mmUpdateTime := range jobChan {
+		eventId := strings.Split(mmUpdateTime.Field, "_")[0]
 		for _, event := range events {
 			if eventId != event.EventId {
 				continue
 			}
-			log.Printf("刪除 key : %v, id: %v", key, event.EventId)
-			pipe.HDel(ctx, MmUpdateTimeKey, key)
+			t, _ := time.Parse(TimeFormat, mmUpdateTime.UpdateTime)
+			expireTime, _ := time.ParseDuration(ExpireTime)
+			if t.Add(expireTime).After(time.Now()) {
+				continue
+			}
+			log.Printf("刪除 key : %v, id: %v", mmUpdateTime.Field, event.EventId)
+			repo.deleteMMUpdateTime(ctx, pipe, mmUpdateTime.Field)
 		}
 		wg.Done()
 	}
 }
 
-func getAllDoneEvents() []Betfair {
-	db := postgres.NewPostgresClient()
-	var result []Betfair
-	db.Table("betfair").Select("event_id").Where("settle_dt != ?", "0001-01-01 00:00:00").Find(&result)
+func (repo *MMUpdateTimeRepository) deleteMMUpdateTime(ctx context.Context, pipe redis.Pipeliner, field string) {
+	pipe.HDel(ctx, MmUpdateTimeKey, field)
+}
 
+func (repo *MMUpdateTimeRepository) getAllDoneEvents() []Betfair {
+	var result []Betfair
+	repo.db.Table("betfair").Select("event_id").Where("settle_dt != ?", "0001-01-01 00:00:00").Find(&result)
 	return result
 }
 
-func setFakeMMUpdateTime() {
+func (repo *MMUpdateTimeRepository) setFakeMMUpdateTime() {
 	tstring := time.Now().Format(TimeFormat)
 	fieldName := "31104929_1.198617688_44720863_b"
-	pipe := rdb.TxPipeline()
+	pipe := repo.rdb.TxPipeline()
 	for i := 0; i < 10000; i++ {
 		err := pipe.HSet(ctx, MmUpdateTimeKey, fmt.Sprintf("%v%v", fieldName, string(i)), tstring).Err()
 		if err != nil {
@@ -93,11 +120,10 @@ func setFakeMMUpdateTime() {
 	pipe.Exec(ctx)
 }
 
-func getMMUpdateTimeKeys() []string {
-	res, err := rdb.HKeys(ctx, MmUpdateTimeKey).Result()
+func (repo *MMUpdateTimeRepository) getAllMMUpdateTime() map[string]string {
+	res, err := repo.rdb.HGetAll(ctx, MmUpdateTimeKey).Result()
 	if err != nil {
 		log.Println(err)
 	}
-
 	return res
 }
