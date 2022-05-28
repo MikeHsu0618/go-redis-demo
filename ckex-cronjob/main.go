@@ -9,6 +9,7 @@ import (
 	"gorm.io/gorm"
 	"log"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -114,7 +115,7 @@ func (repo *MMUpdateTimeRepository) setFakeMMUpdateTime() {
 	fieldName := "31104929_1.198617688_44720863_b"
 	pipe := repo.rdb.TxPipeline()
 	for i := 0; i < 10000; i++ {
-		err := pipe.HSet(ctx, MmUpdateTimeKey, fmt.Sprintf("%v%v", fieldName, string(i)), tstring).Err()
+		err := pipe.HSet(ctx, MmUpdateTimeKey, fmt.Sprintf("%v%v", fieldName, strconv.Itoa(i)), tstring).Err()
 		if err != nil {
 			log.Println(err)
 		}
