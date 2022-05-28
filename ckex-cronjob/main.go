@@ -8,6 +8,7 @@ import (
 	redispkg "go-redis-demo/pkg/redis"
 	"gorm.io/gorm"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -52,10 +53,10 @@ func main() {
 	// 取得 hash{ mm_update_time } 所有的 Key 並且丟進 channel 中
 	results := repo.getAllMMUpdateTime()
 	wg.Add(len(results))
-	// 開啟 transaction pipeline
+
 	pipe := repo.rdb.TxPipeline()
-	// 開啟 10 個 worker -> 取得一個 key 開始跟 event_id 比對, 如果在其中就 HDel Key
-	for i := 0; i < 10; i++ {
+	// 開啟 10 個 worker -> 取得一個 field 開始跟 event_id 比對, 如果在其中就 HDel field
+	for i := 0; i < runtime.NumCPU(); i++ {
 		go repo.worker(jobChan, wg, pipe, events)
 	}
 	// 插入 jobChan
